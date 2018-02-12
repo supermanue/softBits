@@ -20,26 +20,29 @@ It can be executed in two ways:
 from a past execution. It is loaded and replayed
 
 INPUT PARAMETERS:
-$1: fraction of cluster employed
-$2: cluster size
-$3: min job size
-$4: max job size
-$5: min job length, in seconds
-$6: max job length, in seconds
-$7: desired experiment length in seconds
+$1: base dir
+$2: fraction of cluster employed
+$3: desired experiment length in seconds
 
 OR
-$1: name of the trace file to replay
+$1: base dir
+$2: name of the trace file to replay
 '''
 
 import sys
-from random import randint
-from time import sleep
+from random import randint,uniform
+from time import time, sleep
 import tempfile
 import shutil
 import os
 from numpy.random import normal
 import pickle
+from subprocess import Popen, PIPE
+import re
+import signal
+from tempfile import mkstemp
+
+
 
 class Job:
     jobId = -1
@@ -60,12 +63,12 @@ class Job:
     #creates a Slurm template and submits the job
     def submit(self, tmpDir):
         template = self.createJobTemplate(tmpDir)
-        os.system("sbatch " + template)
+        os.system("sbatch --output=" + tmpDir+ "/slurm-%j.out " + template)
         print ("job shuld be submitted now")
 
     def createJobTemplate(self, tmpDir):
 
-        fileName = tempfile.mkstemp(dir = tmpDir)[1]
+        fileName = mkstemp(dir = tmpDir)[1]
         print (fileName)
         templateFile = open(fileName, 'w')
 
@@ -77,14 +80,77 @@ class Job:
 
 
 
+def readNodeStatus():
+    nodeStatus={}
+
+    a = Popen('sinfo -Nh', shell=True, stdout=PIPE)
+    b = a.stdout.read()
+    for line in b.split("\n"):
+        splittedLine = re.split(' *', line) #elements are separated by a variable number of spaces
+        if len(splittedLine) ==1 :
+            break
+        nodeName = splittedLine[0]
+        nodeState = splittedLine[3]
+
+        if nodeName not in nodeStatus.keys(): #in case the same node is in several queueues, take only one
+            if nodeState =="idle":
+                nodeStatus[nodeName] = 0
+            elif nodeState =="mix":
+		        nodeStatus[nodeName] = 1
+            else:
+                nodeStatus[nodeName] = 2
+    return nodeStatus
+
+def readCPUStatus():
+    a = Popen('sinfo -o %C -h', shell=True, stdout=PIPE)
+    line = a.stdout.read()
+
+    splittedVals=re.split("/", line)
+    allocatedCPUs=splittedVals[0].strip()
+    freeCPUs=splittedVals[1].strip()
+    return (allocatedCPUs, freeCPUs)
+
+
+def updateNodeStatus(fileName,  timestamp, nodeStatus, cpuStatus):
+    newStatus=str(timestamp) + ","
+    first=True
+    for nodeName in sorted(nodeStatus.keys()):
+        if first:
+            first = False
+        else:
+            newStatus+=","
+
+        newStatus += str(nodeStatus[nodeName])
+    newStatus+=","+cpuStatus[0] +","+cpuStatus[1]
+    newStatus +="\n"
+    templateFile = open(fileName, 'a')
+    templateFile.write(newStatus)
+    templateFile.close()
+
+def writeFileHeaders(fileName, nodeStatus):
+    newStatus="Timestamp,"
+    first=True
+    for nodeName in sorted(nodeStatus.keys()):
+        if first:
+            first = False
+        else:
+            newStatus+=","
+
+        newStatus += str(nodeName)
+    newStatus +=",UsedCPUs,FreeCPUs"
+    newStatus +="\n"
+    templateFile = open(fileName, 'a')
+    templateFile.write(newStatus)
+    templateFile.close()
+
 if __name__ == '__main__':
-
-
     jobList = []
-    experimentLength = 0
+    rootDir = sys.argv[1]
+    experimentLength=0
+    monitorTime=5
 
-    if (len(sys.argv) ==2):
-        pickleFileName = sys.argv[1]
+    if (len(sys.argv) ==3):
+        pickleFileName = sys.argv[2]
         pickleFile = open (pickleFileName, 'r')
         jobList = pickle.load(pickleFile)
         pickleFile.close()
@@ -93,20 +159,21 @@ if __name__ == '__main__':
         #calculate experiment end
         #number 10 is just in case, to have a small margin
         experimentLength = 10 + reduce((lambda x, y: max(x,y)), map(lambda x: x.startOffset, jobList))
-        print experimentLength
+        experimentFolder=rootDir
 
+        outputFileName = rootDir+"cluster_status.txt"
+        print ("cluster status log saved in " + outputFileName)
 
+    elif (len(sys.argv) == 4):
+        fractionOfClusterEmployed = float(sys.argv[2])
+        experimentLength = int(sys.argv[3])
 
-    elif (len(sys.argv) == 8):
-
-        fractionOfClusterEmployed = float(sys.argv[1])
-        clusterSize = int(sys.argv[2])
-        minJobSize = int(sys.argv[3])
-        maxJobSize = int(sys.argv[4])
-        minJobLength = int(sys.argv[5])
-        maxJobLength = int(sys.argv[6])
-        experimentLength = int(sys.argv[7])
-
+        ########SOME CONSTANTS
+        clusterSize = 128
+        minJobSize = 1
+        maxJobSize = clusterSize / 8
+        minJobLength = 1000 #seconds
+        maxJobLength = max (minJobLength * 50 ,experimentLength * 0.05)  # entre 50 veces el minimo y el 5% del tiempo total
 
         totalResourceAvailability = clusterSize * experimentLength * fractionOfClusterEmployed
 
@@ -114,13 +181,18 @@ if __name__ == '__main__':
         jobCounter = 0
         while (totalResourceAvailability > 0):
             ##gausian distribution of jobs: most of them are small. This is truncated to 1 so it is not perfect, but it's good enough
-            ##1.1 is to allow some values over 1, so jobLength can be maxJobLength sometimes.
+            ##1.1 is to allow some values over 1, so jobSize can be maxJobSize sometimes.
             gaussian =2
             while gaussian >1.1:
-                gaussian = abs(normal())
-            print gaussian
+                gaussian = (abs(normal()) / 3.0)  #normal returns values between 0 and 3. Aslo we want mostly small ones
             jobSize = int(max (1,  gaussian * float(maxJobSize)))
-            jobLength = randint (minJobLength, maxJobLength)
+
+            gaussian =2
+            while gaussian >1:
+                gaussian = (abs(normal()) / 3.0)  #normal returns values between 0 and 3. Aslo we want mostly small ones
+
+            jobLength = int(minJobLength + uniform (0, maxJobLength-minJobLength) * gaussian)
+
             startOffset = randint (0, experimentLength - jobLength)
 
             #check if the job is too big for the remaining resource availability, and trim it if so
@@ -137,39 +209,58 @@ if __name__ == '__main__':
             print ("remaining tresources = " + str(totalResourceAvailability))
 
         jobList.sort(key=lambda job: 0 - job.startOffset)
-        exportJobListName = tempfile.mkstemp()[1]
+
+
+        #we want first job to start at time 0 and last job to end at time "experimentLength".
+        jobList[len(jobList)-1].startOffset = 10 #not exactly at 0, in case of overheads...
+        jobList[0].startTime  = experimentLength - jobList[len(jobList)-1].jobLength
+
+
+        ####
+        #FILE MANAGEMENT
+        experimentFolder=rootDir+"/load"+str(fractionOfClusterEmployed)+"_lenght"+str(experimentLength)+"/"
+        os.makedirs(experimentFolder)
+
+        exportJobListName = experimentFolder+"jobList_human.txt"
+        pickleFileName = experimentFolder+"jobList_pickle.txt"
+        outputFileName = experimentFolder+"cluster_status.txt"
+
+        print ("job list (for humans) saved in  " + exportJobListName)
+        print ("job list (for computers) saved in " + pickleFileName)
+        print ("cluster status log saved in " + outputFileName)
 
         exportJobList = open (exportJobListName, 'w')
-
         for job in jobList:
             exportJobList.write(str(job) +"\n")
         exportJobList.close()
-        print ("job list exported to " + exportJobListName)
 
-        pickleFileName = tempfile.mkstemp()[1]
         pickleFile = open (pickleFileName, 'w')
         pickle.dump(jobList, pickleFile)
         pickleFile.close()
-        print ("job trace exported to " + pickleFileName)
-        exit
 
 
     print ("SORTED LIST OF JOBS")
     for job in jobList:
         print (job)
 
-    tmpDir = tempfile.mkdtemp()
+    nodeStatus = readNodeStatus()
+    writeFileHeaders(outputFileName, nodeStatus)
 
-    time = 0
+    elapsedTime = 0
     auxJob = jobList.pop()
-    while time < experimentLength:
-        print (time)
-        if auxJob.startOffset <= time:
-            auxJob.submit(tmpDir)
+    while elapsedTime < experimentLength:
+        print (elapsedTime)
+        if auxJob.startOffset <= elapsedTime:
+            auxJob.submit(experimentFolder)
             try:
                 auxJob = jobList.pop()
             except:
                 break
         sleep(1)
-        time +=1
-    shutil.rmtree(tmpDir)
+        elapsedTime +=1
+
+        if (elapsedTime %monitorTime ==0):
+            now = int(time())
+            nodeStatus = readNodeStatus()
+            cpuStatus = readCPUStatus()
+            updateNodeStatus(outputFileName, now, nodeStatus, cpuStatus)
